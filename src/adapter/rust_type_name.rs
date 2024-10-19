@@ -3,20 +3,20 @@ use std::fmt::{Display, Formatter, Result};
 /// Serializes the `rustdoc_types::Type` type as a String containing the name
 /// of the type, as close as possible to the original code declaration.
 pub(crate) fn rust_type_name(ty: &rustdoc_types::Type) -> String {
-    Type(ty).to_string()
+    Type(ty, false).to_string()
 }
 
 /// Creates a struct named `$t` that wraps a `rustdoc_types::$t` reference,
 /// and implements `Display` on it by calling the given `$formatter` function.
 macro_rules! display_wrapper {
-    ($vis:vis $t:ident, $formatter:ident) => {
+    ($vis:vis $t:ident, $formatter:ident $(,  $extra:ident)*) => {
         #[doc = concat!(
             "Wraps a &rustdoc_types::",
             stringify!($t),
             " to implement [`Display`]."
         )]
         #[derive(Debug, Clone, Copy)]
-        $vis struct $t<'a>($vis &'a rustdoc_types::$t);
+        $vis struct $t<'a>($vis &'a rustdoc_types::$t $(, $extra)*);
 
         impl Display for $t<'_> {
             fn fmt(&self, f: &mut Formatter<'_>) -> Result {
@@ -74,18 +74,22 @@ fn fmt_generic_param_def(this: &GenericParamDef, f: &mut Formatter<'_>) -> Resul
             is_synthetic,
         } => {
             if *is_synthetic {
-                todo!("is_synthetic generic");
+                unreachable!(
+                    "synthetic generic definitions do not occur in types.\n\
+                    This code will need to be updated if used to format generic definitions \
+                    (e.g., in functions)."
+                )
             }
 
             write!(f, "{}", this.0.name)?;
-            intersperse_with(f, " + ", bounds, GenericBound)?;
+            intersperse_with(f, " + ", bounds, |gb| GenericBound(gb, bounds.len() > 1))?;
 
             if let Some(def) = default {
-                write!(f, " = {}", Type(def))?;
+                write!(f, " = {}", Type(def, false))?;
             }
         }
         rustdoc_types::GenericParamDefKind::Const { type_, default } => {
-            write!(f, "const {}: {}", this.0.name, Type(type_))?;
+            write!(f, "const {}: {}", this.0.name, Type(type_, false))?;
 
             if let Some(def) = default {
                 write!(f, " = {def}")?;
@@ -104,20 +108,48 @@ fn fmt_poly_trait(this: &PolyTrait, f: &mut Formatter<'_>) -> Result {
         write!(f, "> ")?;
     }
 
-    write!(f, "{}", Path(&this.0.trait_))
+    write!(f, "{}", Path(&this.0.trait_, this.1))
 }
 
-display_wrapper!(PolyTrait, fmt_poly_trait);
+display_wrapper!(PolyTrait, fmt_poly_trait, bool);
 
 fn fmt_type(this: &Type, f: &mut Formatter<'_>) -> Result {
     match this.0 {
-        rustdoc_types::Type::ResolvedPath(path) => write!(f, "{}", Path(path)),
+        rustdoc_types::Type::ResolvedPath(path) => {
+            assert!(
+                !matches!(
+                    path.args.as_deref(),
+                    Some(rustdoc_types::GenericArgs::Parenthesized { .. })
+                ),
+                "args for a type (vs a trait) should be bracketed, not parenthesized"
+            );
+            write!(f, "{}", Path(path, false))
+        }
         rustdoc_types::Type::DynTrait(dyn_trait) => {
+            if this.1 {
+                write!(f, "(")?;
+            }
+
+            let num_args = dyn_trait.traits.len() + dyn_trait.lifetime.iter().count();
+
             write!(f, "dyn ")?;
-            intersperse_with(f, " + ", &dyn_trait.traits, PolyTrait)?;
+            intersperse(
+                f,
+                " + ",
+                dyn_trait.traits.iter().enumerate(),
+                |(i, pt), f| {
+                    // If this is the last bound, it is not followed by a +, and e.g., if it
+                    // is Fn() -> &dyn ..., it doesn't need to be wrapped in parentheses.
+                    write!(f, "{}", PolyTrait(pt, i + 1 < num_args))
+                },
+            )?;
 
             if let Some(lt) = &dyn_trait.lifetime {
                 write!(f, " + {lt}")?;
+            }
+
+            if this.1 {
+                write!(f, ")")?;
             }
 
             Ok(())
@@ -182,7 +214,7 @@ fn fmt_type(this: &Type, f: &mut Formatter<'_>) -> Result {
                 fnp.sig
                     .inputs
                     .iter()
-                    .map(|(name, ty)| Arg::Named(name, Type(ty)))
+                    .map(|(name, ty)| Arg::Named(name, Type(ty, false)))
                     .chain(fnp.sig.is_c_variadic.then_some(Arg::Dots)),
                 |arg, f| match arg {
                     Arg::Named(name, ty) => write!(f, "{name}: {ty}"),
@@ -193,29 +225,50 @@ fn fmt_type(this: &Type, f: &mut Formatter<'_>) -> Result {
             write!(f, ")")?;
 
             if let Some(output) = &fnp.sig.output {
-                write!(f, " -> {}", Type(output))?;
+                // If `this` follows + bounds, so does the output, so the output
+                // will need to be wrapped in parentheses if `this.1` is true and it
+                // is a `dyn/impl Trait`.
+                write!(f, " -> {}", Type(output, this.1))?;
             }
 
             Ok(())
         }
         rustdoc_types::Type::Tuple(tys) => {
             write!(f, "(")?;
-            intersperse_with(f, ", ", tys, Type)?;
+            intersperse_with(f, ", ", tys, |x| Type(x, false))?;
             write!(f, ")")
         }
-        rustdoc_types::Type::Slice(ty) => write!(f, "[{}]", Type(ty)),
+        rustdoc_types::Type::Slice(ty) => write!(f, "[{}]", Type(ty, false)),
         // According to the docs for this variant, `len` is not guaranteed to be the
         // same as the source code.  For example, [u8; 1 + 2] currently becomes [u8; 3]
-        rustdoc_types::Type::Array { type_, len } => write!(f, "[{}; {}]", Type(type_), len),
+        rustdoc_types::Type::Array { type_, len } => write!(f, "[{}; {}]", Type(type_, false), len),
         rustdoc_types::Type::ImplTrait(vec) => {
+            if this.1 {
+                write!(f, "(")?;
+            }
             write!(f, "impl ")?;
-            intersperse_with(f, " + ", vec, GenericBound)
+            intersperse_with(f, " + ", vec, |gb| GenericBound(gb, vec.len() > 1))?;
+
+            if this.1 {
+                write!(f, ")")?;
+            }
+
+            Ok(())
         }
         rustdoc_types::Type::Infer => write!(f, "_"),
         rustdoc_types::Type::RawPointer { is_mutable, type_ } => {
-            let kind = if *is_mutable { "mut" } else { "const" };
+            // When there are multiple bounds on a `dyn` or `impl` trait raw pointer,
+            // it needs to be wrapped in parentheses.
+            let force_wrap_parens = match &**type_ {
+                rustdoc_types::Type::DynTrait(dyn_trait) => {
+                    dyn_trait.traits.len() + dyn_trait.lifetime.iter().count() > 1
+                }
+                rustdoc_types::Type::ImplTrait(bounds) => bounds.len() > 1,
+                _ => false,
+            };
 
-            write!(f, "*{kind} {}", Type(type_))
+            let kind = if *is_mutable { "mut" } else { "const" };
+            write!(f, "*{kind} {}", Type(type_, force_wrap_parens || this.1))
         }
         rustdoc_types::Type::BorrowedRef {
             lifetime,
@@ -231,37 +284,17 @@ fn fmt_type(this: &Type, f: &mut Formatter<'_>) -> Result {
                 write!(f, "mut ")?;
             }
 
-            // References can create ambiguity when there is an `impl/dyn Trait + ...`
-            // block:
-            //
-            // `&dyn Read + Send + Sync` is rejected by the compiler, it should be
-            // `&(dyn Read + Send + Sync)`.
-            //
-            // Parentheses for an `impl/dyn Trait` with no `+` are not always required,
-            // but it can create ambiguity with e.g., `impl Fn() -> &dyn Trait + Send + Sync`,
-            // which could be `Fn() -> &(dyn Trait) + Send + Sync`
-            // or `Fn() -> &(dyn Trait + Send + Sync)`.
-            //
-            // Unconditionally wrapping an `impl/dyn Trait` reference with parentheses
-            // may create something syntactially different from the original statement,
-            // but it will always be semantically equivalent, and lets the formatting be more
-            // context-free than keeping track of when parentheses are needed.
-            let wrap_parens = matches!(
-                &**type_,
-                rustdoc_types::Type::DynTrait(_) | rustdoc_types::Type::ImplTrait(_)
-            );
+            // References to `dyn/impl Trait`s must be wrapped in parentheses if there
+            // more than 1 bound.
+            let force_wrap_parens = match &**type_ {
+                rustdoc_types::Type::DynTrait(dyn_trait) => {
+                    dyn_trait.traits.len() + dyn_trait.lifetime.iter().count() > 1
+                }
+                rustdoc_types::Type::ImplTrait(bounds) => bounds.len() > 1,
+                _ => false,
+            };
 
-            if wrap_parens {
-                write!(f, "(")?;
-            }
-
-            write!(f, "{}", Type(type_))?;
-
-            if wrap_parens {
-                write!(f, ")")?;
-            }
-
-            Ok(())
+            write!(f, "{}", Type(type_, force_wrap_parens || this.1))
         }
         rustdoc_types::Type::QualifiedPath {
             name,
@@ -270,18 +303,26 @@ fn fmt_type(this: &Type, f: &mut Formatter<'_>) -> Result {
             trait_,
         } => {
             if let Some(trait_) = trait_ {
-                write!(f, "<{} as {}>", Type(self_type), Path(trait_))?;
+                write!(f, "<{} as {}>", Type(self_type, false), Path(trait_, false))?;
             } else {
-                write!(f, "{}", Type(self_type))?;
+                write!(f, "{}", Type(self_type, false))?;
             }
 
-            write!(f, "::{}{}", name, GenericArgs(args))
+            assert!(
+                !matches!(&**args, rustdoc_types::GenericArgs::Parenthesized { .. }),
+                "args for a type should be bracketed, not parenthesized"
+            );
+
+            write!(f, "::{}{}", name, GenericArgs(args, false))
         }
         rustdoc_types::Type::Pat { .. } => unimplemented!("Type::Pat is unstable"),
     }
 }
 
-display_wrapper!(Type, fmt_type);
+// The `bool` parameter represents whether this type comes before `+` bounds.
+// In cases where the type ends in a `dyn Trait` or `impl Trait`, it will need to
+// be wrapped in parentheses.
+display_wrapper!(Type, fmt_type, bool);
 
 fn fmt_generic_bound(this: &GenericBound, f: &mut Formatter<'_>) -> Result {
     match &this.0 {
@@ -303,7 +344,7 @@ fn fmt_generic_bound(this: &GenericBound, f: &mut Formatter<'_>) -> Result {
                 rustdoc_types::TraitBoundModifier::None => (),
             };
 
-            write!(f, "{}", Path(trait_))?;
+            write!(f, "{}", Path(trait_, this.1))?;
 
             Ok(())
         }
@@ -316,7 +357,11 @@ fn fmt_generic_bound(this: &GenericBound, f: &mut Formatter<'_>) -> Result {
     }
 }
 
-display_wrapper!(GenericBound, fmt_generic_bound);
+// The `bool` parameter indicates whether the bound is preceded or followed by a
+// ` + ` bound.  In this case, for [`rustdoc_types::GenericBound::Parenthesized`],
+// the `-> output` may need to be wrapped in parentheses if could contain `+` bounds
+// (e.g., for `dyn` or `impl Trait`) to avoid ambiguity.
+display_wrapper!(GenericBound, fmt_generic_bound, bool);
 
 fn fmt_constant(this: &Constant, f: &mut Formatter<'_>) -> Result {
     if let Some(val) = &this.0.value {
@@ -343,7 +388,7 @@ fn fmt_generic_args(this: &GenericArgs, f: &mut Formatter<'_>) -> Result {
                         write!(f, "{lt}")
                     }
                     rustdoc_types::GenericArg::Type(t) => {
-                        write!(f, "{}", Type(t))
+                        write!(f, "{}", Type(t, false))
                     }
                     rustdoc_types::GenericArg::Const(constant) => {
                         write!(f, "{}", Constant(constant))
@@ -358,16 +403,21 @@ fn fmt_generic_args(this: &GenericArgs, f: &mut Formatter<'_>) -> Result {
                 }
 
                 intersperse(f, ", ", constraints, |constraint, f| {
-                    write!(f, "{}{}", constraint.name, GenericArgs(&constraint.args))?;
+                    write!(
+                        f,
+                        "{}{}",
+                        constraint.name,
+                        GenericArgs(&constraint.args, false)
+                    )?;
                     match &constraint.binding {
                         rustdoc_types::AssocItemConstraintKind::Constraint(c) => {
                             write!(f, ": ")?;
-                            intersperse_with(f, " + ", c, GenericBound)?;
+                            intersperse_with(f, " + ", c, |gb| GenericBound(gb, c.len() > 1))?;
                         }
                         rustdoc_types::AssocItemConstraintKind::Equality(e) => {
                             write!(f, " = ")?;
                             match e {
-                                rustdoc_types::Term::Type(ty) => write!(f, "{}", Type(ty))?,
+                                rustdoc_types::Term::Type(ty) => write!(f, "{}", Type(ty, false))?,
                                 rustdoc_types::Term::Constant(c) => write!(f, "{}", Constant(c))?,
                             }
                         }
@@ -382,10 +432,10 @@ fn fmt_generic_args(this: &GenericArgs, f: &mut Formatter<'_>) -> Result {
         }
         rustdoc_types::GenericArgs::Parenthesized { inputs, output } => {
             write!(f, "(")?;
-            intersperse_with(f, ", ", inputs, Type)?;
+            intersperse_with(f, ", ", inputs, |ty| Type(ty, false))?;
             write!(f, ")")?;
             if let Some(output) = output {
-                write!(f, " -> {}", Type(output))?;
+                write!(f, " -> {}", Type(output, this.1))?;
             }
         }
     }
@@ -393,17 +443,17 @@ fn fmt_generic_args(this: &GenericArgs, f: &mut Formatter<'_>) -> Result {
     Ok(())
 }
 
-display_wrapper!(GenericArgs, fmt_generic_args);
+display_wrapper!(GenericArgs, fmt_generic_args, bool);
 
 fn fmt_path(this: &Path, f: &mut Formatter<'_>) -> Result {
     write!(f, "{}", this.0.name)?;
     if let Some(args) = this.0.args.as_deref() {
-        write!(f, "{}", GenericArgs(args))?;
+        write!(f, "{}", GenericArgs(args, this.1))?;
     }
     Ok(())
 }
 
-display_wrapper!(Path, fmt_path);
+display_wrapper!(Path, fmt_path, bool);
 
 #[cfg(test)]
 mod tests {
@@ -624,6 +674,8 @@ mod tests {
                     ("tuple", "(u32, (), T)"),
                     ("slice", "Box<[u8]>"),
                     ("array", "[(); 3]"),
+                    ("array2", "[(); 1]"),
+                    ("array3", "[(); 30]"),
                     ("raw_pointer", "*const u8"),
                     ("borrowed_ref", "&'static str"),
                     (
@@ -670,6 +722,46 @@ mod tests {
             similar_asserts::assert_eq!(
                 rust_type_name(func.sig.output.as_ref().expect("no output")),
                 "impl std::any::Any"
+            );
+        });
+    }
+
+    #[test]
+    fn dyn_ambiguity() {
+        with_crate_root(|crate_, module| {
+            let func = module
+                .items
+                .iter()
+                .find_map(|x| {
+                    let item = crate_.index.get(x)?;
+                    if item.name.as_ref()? == "dyn_ambiguity" {
+                        if let rustdoc_types::ItemEnum::Function(func) = &item.inner {
+                            return Some(func);
+                        }
+                    }
+
+                    None
+                })
+                .expect("couldn't find fn `dyn_ambiguity`");
+
+            let inputs: Vec<_> = func
+                .sig
+                .inputs
+                .iter()
+                .map(|(k, v)| (k, rust_type_name(v)))
+                .collect();
+
+            similar_asserts::assert_eq!(
+                inputs
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("a", "&'a (impl Fn() -> *const fn() -> &'a (dyn Iterator<Item = ()> + Unpin) + Send)"),
+                    ("b", "Box<dyn Fn() -> *const (dyn Unpin + Fn() -> &'static mut (dyn std::any::Any + Sync)) + Sync>"),
+                    ("c", "fn() -> &'a (dyn Send + Fn() -> *const dyn std::any::Any)"),
+                    ("no_parens", "impl for<'x> Fn(&'x ()) -> &'x dyn std::fmt::Debug"),
+                    ("sanity", "&dyn std::fmt::Display"),
+                ]
             );
         });
     }

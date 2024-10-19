@@ -17,6 +17,16 @@ impl<'a> GAT<&'a ()> for Struct<'a> {
 
 pub struct Constant<const N: usize>;
 
+const fn const_fn() -> usize {
+    let mut i = 0;
+
+    while i < 27 {
+        i += 5;
+    }
+
+    i
+}
+
 /// Tests for base-case variants of [`Type`]
 ///
 /// [`Type`]: https://docs.rs/rustdoc-types/latest/rustdoc_types/enum.Type.html
@@ -29,6 +39,8 @@ pub struct TypeEnum<T> {
     pub tuple: (u32, (), T),
     pub slice: Box<[u8]>,
     pub array: [(); 1 + 2],
+    pub array2: [(); usize::MAX >> (usize::BITS - 1)],
+    pub array3: [(); const_fn()],
     // impl Trait
     // Infer
     pub raw_pointer: *const u8,
@@ -38,6 +50,15 @@ pub struct TypeEnum<T> {
 
 pub fn is_synthetic(x: impl std::any::Any) -> impl std::any::Any {
     x
+}
+
+pub fn dyn_ambiguity<'a>(
+    a: &'a (impl Fn() -> *const fn() -> &'a (dyn Iterator<Item = ()> + Unpin) + Send),
+    b: Box<dyn Fn() -> *const (dyn Unpin + Fn() -> &'static mut (dyn std::any::Any + Sync)) + Sync>,
+    c: fn() -> &'a (dyn Send + Fn() -> *const dyn std::any::Any),
+    no_parens: impl for<'x> Fn(&'x ()) -> &'x dyn std::fmt::Debug,
+    sanity: &dyn std::fmt::Display,
+) {
 }
 
 pub fn my_generic_function<'a, T, U: GAT<T>>(
